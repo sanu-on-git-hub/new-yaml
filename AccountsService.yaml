@@ -1,0 +1,24 @@
+---
+- name: Delete OPO users from AccountsService
+  hosts: all
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    - name: Find all AccountsService user files
+      ansible.builtin.find:
+        paths: /var/lib/AccountsService/users/
+        file_type: file
+        recurse: false
+      register: accountsservice_users
+
+    - name: Delete OPO users except root and opoadmin
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ accountsservice_users.files }}"
+      when:
+        - item.path | basename | lower != 'root'
+        - item.path | basename | lower != 'opoadmin'
+        - item.path | basename | lower is match('^opo[0-9]+$')
