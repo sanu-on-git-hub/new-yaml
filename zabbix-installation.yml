@@ -1,0 +1,422 @@
+---
+- name: Install and configure Zabbix Agent 2 using VLAN detection
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    zabbix_version: "7.0"
+
+    # Location mapping based on the target system's IPv4 subnet.
+    # These examples assume /24 subnets. Adjust if your VLAN masks differ.
+    #
+    # 172.18.34.x is explicitly mapped to MUMBAI.
+    zabbix_vlan_map:
+      - prefix: "192.168.0."
+        location: "mumbai"
+        server_ip: "192.168.0.222"
+
+      - prefix: "172.18.34."
+        location: "mumbai"
+        server_ip: "192.168.0.222"
+
+      - prefix: "172.24.11."
+        location: "gurgaon"
+        server_ip: "172.24.11.222"
+
+      - prefix: "172.21.11."
+        location: "bangalore"
+        server_ip: "172.21.11.222"
+
+      - prefix: "172.19.11."
+        location: "chennai"
+        server_ip: "172.19.11.222"
+
+    zabbix_deb_path: "/tmp/zabbix-release.deb"
+    zabbix_rpm_path: "/tmp/zabbix-release.rpm"
+    zabbix_config: "/etc/zabbix/zabbix_agent2.conf"
+
+  tasks:
+
+    # ---------------------------------------------------------
+    # STAGE 1: Detect and validate the target system
+    # ---------------------------------------------------------
+
+    - name: Display detected system information
+      ansible.builtin.debug:
+        msg:
+          - "Distribution: {{ ansible_distribution }}"
+          - "OS family: {{ ansible_os_family }}"
+          - "OS version: {{ ansible_distribution_version }}"
+          - "Architecture: {{ ansible_architecture }}"
+          - "System hostname: {{ ansible_hostname }}"
+          - "Primary IP: {{ ansible_default_ipv4.address | default('NOT DETECTED') }}"
+          - "Inventory groups: {{ group_names }}"
+
+    - name: Validate supported operating system
+      ansible.builtin.assert:
+        that:
+          - >
+            (
+              ansible_os_family == 'Debian'
+              and (
+                (
+                  ansible_distribution == 'Ubuntu'
+                  and ansible_distribution_version in
+                    ['20.04', '22.04', '24.04']
+                )
+                or
+                (
+                  ansible_distribution == 'Debian'
+                  and ansible_distribution_major_version in ['11', '12']
+                )
+              )
+            )
+            or
+            (
+              ansible_os_family == 'RedHat'
+              and ansible_distribution_major_version in ['8', '9']
+              and ansible_architecture == 'x86_64'
+            )
+        fail_msg: >-
+          Unsupported OS/version/architecture.
+          Supported: Ubuntu 20.04/22.04/24.04, Debian 11/12,
+          and x86_64 RHEL-family 8/9.
+        success_msg: "Operating system is supported."
+
+    - name: Validate target primary IPv4 address
+      ansible.builtin.assert:
+        that:
+          - ansible_default_ipv4.address is defined
+          - ansible_default_ipv4.address | length > 0
+        fail_msg: "Cannot determine target primary IPv4 address."
+
+    # ---------------------------------------------------------
+    # STAGE 2: Select location using the target IP, not groups
+    # ---------------------------------------------------------
+
+    - name: Initialize detected location
+      ansible.builtin.set_fact:
+        zabbix_location: ""
+        zabbix_server_ip: ""
+        zabbix_agent_hostname: "{{ ansible_default_ipv4.address }}"
+
+    - name: Detect Mumbai VLAN 192.168.0.x
+      ansible.builtin.set_fact:
+        zabbix_location: "mumbai"
+        zabbix_server_ip: "192.168.0.222"
+      when: ansible_default_ipv4.address is match('^192\\.168\\.0\\.[0-9]+$')
+
+    - name: Detect Mumbai VLAN 172.18.34.x
+      ansible.builtin.set_fact:
+        zabbix_location: "mumbai"
+        zabbix_server_ip: "192.168.0.222"
+      when: ansible_default_ipv4.address is match('^172\\.18\\.34\\.[0-9]+$')
+
+    - name: Detect Gurgaon VLAN
+      ansible.builtin.set_fact:
+        zabbix_location: "gurgaon"
+        zabbix_server_ip: "172.24.11.222"
+      when: ansible_default_ipv4.address is match('^172\\.24\\.11\\.[0-9]+$')
+
+    - name: Detect Bangalore VLAN
+      ansible.builtin.set_fact:
+        zabbix_location: "bangalore"
+        zabbix_server_ip: "172.21.11.222"
+      when: ansible_default_ipv4.address is match('^172\\.21\\.11\\.[0-9]+$')
+
+    - name: Detect Chennai VLAN
+      ansible.builtin.set_fact:
+        zabbix_location: "chennai"
+        zabbix_server_ip: "172.19.11.222"
+      when: ansible_default_ipv4.address is match('^172\\.19\\.11\\.[0-9]+$')
+
+    - name: Fail if the target IP does not match a known VLAN
+      ansible.builtin.assert:
+        that:
+          - zabbix_location | length > 0
+          - zabbix_server_ip | length > 0
+        fail_msg: >-
+          No Zabbix location mapping exists for
+          {{ ansible_default_ipv4.address }}.
+          Add the correct subnet to the playbook before proceeding.
+        success_msg: "Target IP matched a configured Zabbix location."
+
+    - name: Display selected location and server
+      ansible.builtin.debug:
+        msg:
+          - "Detected location: {{ zabbix_location }}"
+          - "Target IP / Agent Hostname: {{ zabbix_agent_hostname }}"
+          - "Selected Zabbix server: {{ zabbix_server_ip }}"
+
+    # ---------------------------------------------------------
+    # STAGE 3: Check installed Zabbix repository package
+    # ---------------------------------------------------------
+
+    - name: Gather installed package information
+      ansible.builtin.package_facts:
+        manager: auto
+
+    - name: Determine whether zabbix-release is installed
+      ansible.builtin.set_fact:
+        zabbix_release_installed: >-
+          {{ 'zabbix-release' in ansible_facts.packages }}
+
+    - name: Display repository package status
+      ansible.builtin.debug:
+        msg: >-
+          zabbix-release installed:
+          {{ zabbix_release_installed }}.
+          Repository setup will be skipped if already installed.
+
+    # ---------------------------------------------------------
+    # STAGE 4: Construct the official repository package URL
+    # ---------------------------------------------------------
+
+    - name: Set Ubuntu or Debian release package URL
+      ansible.builtin.set_fact:
+        zabbix_release_url: >-
+          {{
+            'https://repo.zabbix.com/zabbix/7.0/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest_7.0+ubuntu'
+            ~ ansible_distribution_version ~ '_all.deb'
+            if ansible_distribution == 'Ubuntu'
+            else
+            'https://repo.zabbix.com/zabbix/7.0/debian/pool/main/z/zabbix-release/zabbix-release_latest_7.0+debian'
+            ~ ansible_distribution_major_version ~ '_all.deb'
+          }}
+      when:
+        - ansible_os_family == 'Debian'
+        - not (zabbix_release_installed | bool)
+
+    - name: Set RHEL-family release package URL
+      ansible.builtin.set_fact:
+        zabbix_release_url: >-
+          https://repo.zabbix.com/zabbix/7.0/rhel/{{
+          ansible_distribution_major_version }}/x86_64/zabbix-release-latest-7.0.el{{
+          ansible_distribution_major_version }}.noarch.rpm
+      when:
+        - ansible_os_family == 'RedHat'
+        - not (zabbix_release_installed | bool)
+
+    # ---------------------------------------------------------
+    # STAGE 5: Check URL, download and validate DEB package
+    # ---------------------------------------------------------
+
+    - name: Verify release package URL is reachable
+      ansible.builtin.uri:
+        url: "{{ zabbix_release_url }}"
+        method: GET
+        status_code: 200
+        return_content: false
+        timeout: 30
+      register: zabbix_url_check
+      retries: 2
+      delay: 3
+      until: zabbix_url_check.status | default(0) == 200
+      when: not (zabbix_release_installed | bool)
+
+    - name: Download Zabbix release DEB
+      ansible.builtin.get_url:
+        url: "{{ zabbix_release_url }}"
+        dest: "{{ zabbix_deb_path }}"
+        mode: "0644"
+        force: true
+        timeout: 60
+      when:
+        - ansible_os_family == 'Debian'
+        - not (zabbix_release_installed | bool)
+
+    - name: Validate downloaded DEB package structure
+      ansible.builtin.command:
+        argv:
+          - dpkg-deb
+          - --info
+          - "{{ zabbix_deb_path }}"
+      register: zabbix_deb_info
+      changed_when: false
+      when:
+        - ansible_os_family == 'Debian'
+        - not (zabbix_release_installed | bool)
+
+    - name: Verify DEB package identity
+      ansible.builtin.assert:
+        that:
+          - zabbix_deb_info.rc == 0
+          - "'Package: zabbix-release' in zabbix_deb_info.stdout"
+          - "'Architecture: all' in zabbix_deb_info.stdout"
+        fail_msg: "Downloaded DEB is invalid or is not zabbix-release."
+      when:
+        - ansible_os_family == 'Debian'
+        - not (zabbix_release_installed | bool)
+
+    - name: Install validated Zabbix release DEB
+      ansible.builtin.apt:
+        deb: "{{ zabbix_deb_path }}"
+        state: present
+      when:
+        - ansible_os_family == 'Debian'
+        - not (zabbix_release_installed | bool)
+
+    # ---------------------------------------------------------
+    # STAGE 6: Download and validate RPM package
+    # ---------------------------------------------------------
+
+    - name: Download Zabbix release RPM
+      ansible.builtin.get_url:
+        url: "{{ zabbix_release_url }}"
+        dest: "{{ zabbix_rpm_path }}"
+        mode: "0644"
+        force: true
+        timeout: 60
+      when:
+        - ansible_os_family == 'RedHat'
+        - not (zabbix_release_installed | bool)
+
+    - name: Validate RPM package integrity
+      ansible.builtin.command:
+        argv:
+          - rpm
+          - --checksig
+          - "{{ zabbix_rpm_path }}"
+      register: zabbix_rpm_check
+      changed_when: false
+      when:
+        - ansible_os_family == 'RedHat'
+        - not (zabbix_release_installed | bool)
+
+    - name: Read RPM package identity
+      ansible.builtin.command:
+        argv:
+          - rpm
+          - -qp
+          - --queryformat
+          - "%{NAME} %{ARCH}"
+          - "{{ zabbix_rpm_path }}"
+      register: zabbix_rpm_info
+      changed_when: false
+      when:
+        - ansible_os_family == 'RedHat'
+        - not (zabbix_release_installed | bool)
+
+    - name: Verify RPM package identity and integrity
+      ansible.builtin.assert:
+        that:
+          - zabbix_rpm_check.rc == 0
+          - zabbix_rpm_info.rc == 0
+          - zabbix_rpm_info.stdout == 'zabbix-release noarch'
+        fail_msg: "RPM validation failed."
+      when:
+        - ansible_os_family == 'RedHat'
+        - not (zabbix_release_installed | bool)
+
+    - name: Install validated Zabbix release RPM
+      ansible.builtin.dnf:
+        name: "{{ zabbix_rpm_path }}"
+        state: present
+        disable_gpg_check: false
+      when:
+        - ansible_os_family == 'RedHat'
+        - not (zabbix_release_installed | bool)
+
+    # ---------------------------------------------------------
+    # STAGE 7: Refresh repository metadata and install Agent 2
+    # ---------------------------------------------------------
+
+    - name: Refresh APT package lists
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+      when: ansible_os_family == 'Debian'
+
+    - name: Check Zabbix Agent 2 candidate version
+      ansible.builtin.command:
+        argv:
+          - apt-cache
+          - policy
+          - zabbix-agent2
+      register: zabbix_agent_candidate
+      changed_when: false
+      when: ansible_os_family == 'Debian'
+
+    - name: Confirm Zabbix Agent 2 is available from APT
+      ansible.builtin.assert:
+        that:
+          - "'Candidate: (none)' not in zabbix_agent_candidate.stdout"
+        fail_msg: >-
+          APT cannot find zabbix-agent2.
+          Check repository configuration and apt-cache policy.
+      when: ansible_os_family == 'Debian'
+
+    - name: Install Zabbix Agent 2 on Debian-family systems
+      ansible.builtin.apt:
+        name: zabbix-agent2
+        state: present
+      when: ansible_os_family == 'Debian'
+
+    - name: Install Zabbix Agent 2 on RHEL-family systems
+      ansible.builtin.dnf:
+        name: zabbix-agent2
+        state: present
+        update_cache: true
+      when: ansible_os_family == 'RedHat'
+
+    # ---------------------------------------------------------
+    # STAGE 8: Configure server IP and agent Hostname
+    # ---------------------------------------------------------
+
+    - name: Remove existing Server, ServerActive and Hostname directives
+      ansible.builtin.replace:
+        path: "{{ zabbix_config }}"
+        regexp: '(?m)^[ \t]*#?[ \t]*(Server|ServerActive|Hostname)[ \t]*=.*(?:\n|$)'
+        replace: ""
+        backup: false
+
+    - name: Write managed Zabbix Agent 2 configuration
+      ansible.builtin.blockinfile:
+        path: "{{ zabbix_config }}"
+        marker: "# {mark} ANSIBLE MANAGED ZABBIX CONFIGURATION"
+        insertafter: EOF
+        block: |
+          Server={{ zabbix_server_ip }}
+          ServerActive={{ zabbix_server_ip }}
+          Hostname={{ zabbix_agent_hostname }}
+        backup: true
+      notify: Restart Zabbix Agent 2
+
+    # ---------------------------------------------------------
+    # STAGE 9: Enable, start and verify the agent
+    # ---------------------------------------------------------
+
+    - name: Enable and start Zabbix Agent 2
+      ansible.builtin.service:
+        name: zabbix-agent2
+        enabled: true
+        state: started
+
+    - name: Apply pending configuration restart
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify Zabbix Agent 2 is active
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - zabbix-agent2
+      register: zabbix_service_status
+      changed_when: false
+      failed_when: zabbix_service_status.stdout | trim != 'active'
+
+    - name: Display successful configuration
+      ansible.builtin.debug:
+        msg:
+          - "Zabbix Agent 2 installation/configuration completed."
+          - "Target IP: {{ zabbix_agent_hostname }}"
+          - "Detected location: {{ zabbix_location }}"
+          - "Zabbix server: {{ zabbix_server_ip }}"
+          - "Service status: {{ zabbix_service_status.stdout | trim }}"
+
+  handlers:
+    - name: Restart Zabbix Agent 2
+      ansible.builtin.service:
+        name: zabbix-agent2
+        state: restarted
